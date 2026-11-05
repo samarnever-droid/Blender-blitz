@@ -1,0 +1,7 @@
+# Pinned for reproducible builds on blitz.cloud.
+# mcp-for-blender is the upstream Blender MCP server (github.com/ahujasid/blender-mcp).
+mcp-for-blender==2.2.7
+mcp==1.30.0
+uvicorn==0.54.0
+starlette==1.10.0
+httpx==0.28.1
