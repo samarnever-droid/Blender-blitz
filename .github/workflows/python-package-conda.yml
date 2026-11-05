@@ -1,0 +1,141 @@
+# Blender + MCP (Model Context Protocol) for blitz.cloud
+#
+# Deliberately plain so any builder can handle it:
+#   - no "# syntax=" frontend directive (blitz's sandbox rejects it)
+#   - single stage, no COPY --from
+#   - no comments inside RUN line-continuations
+#   - only long-standard instructions
+#
+# Serves one port ($PORT, default 8080):
+#   /mcp      MCP Streamable HTTP (bearer token)
+#   /healthz  liveness
+#   /readyz   Blender readiness
+#   /files    JSON index + downloads (bearer token)
+#   /         status page
+#
+# BLENDER_MODE=headless (default) runs `blender -b` and pumps the addon's
+# command queue from a main-thread loop. That avoids Xvfb/OpenGL: ~243 MB idle
+# instead of ~711 MB, so it fits blitz's 512 MB Small ceiling.
+# BLENDER_MODE=gui runs the real GUI on Xvfb for viewport captures and EEVEE,
+# which needs a Medium (1 GB) size or larger.
+
+FROM debian:trixie-slim
+
+ARG BLENDER_SERIES=4.5
+ARG BLENDER_VERSION=4.5.9
+ARG BLENDER_SHA256=dcdc3eca6c9825bb35a8033b689c053f3cb5a9b0cd2a61b2eac2a49436b4ad3d
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV PYTHONUNBUFFERED=1
+ENV PYTHONDONTWRITEBYTECODE=1
+ENV PATH="/opt/venv/bin:/opt/blender:${PATH}"
+
+# Runtime libraries first, so the dependency check below is meaningful.
+# X/GL packages are needed even in headless mode for Blender's linked libs.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl xz-utils \
+    python3 python3-venv \
+    tini \
+    xvfb xauth \
+    libgl1 libglx-mesa0 libgl1-mesa-dri libegl1 libegl-mesa0 \
+    libxi6 libxxf86vm1 libxfixes3 libxrender1 libxext6 libx11-6 libxcb1 \
+    libxkbcommon0 libsm6 libice6 libdbus-1-3 libvulkan1 libgomp1 libuuid1 \
+    libfontconfig1 libfreetype6 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Download Blender and verify it against the official checksum.
+WORKDIR /tmp
+RUN set -eux; \
+    curl -fsSL -o blender.tar.xz "https://download.blender.org/release/Blender${BLENDER_SERIES}/blender-${BLENDER_VERSION}-linux-x64.tar.xz"; \
+    echo "${BLENDER_SHA256}  blender.tar.xz" | sha256sum -c -; \
+    mkdir -p /opt/blender; \
+    tar -xJf blender.tar.xz --strip-components=1 -C /opt/blender; \
+    rm -f blender.tar.xz
+
+# Shrink the install. Only remove things that are dlopened at runtime:
+# Cycles GPU kernels, GPU denoiser backends, the HIP runtime, translations and
+# CPython's test/IDE suites. Never delete lib/*.so such as
+# libcycles_kernel_oneapi_aot.so or lib/mesa: those are hard DT_NEEDED entries.
+RUN set -eux; \
+    find "/opt/blender/${BLENDER_SERIES}/scripts/addons_core/cycles/lib" -type f \( -name '*.cubin.zst' -o -name '*.hipfb.zst' -o -name '*.fatbin.zst' \) -delete; \
+    rm -f /opt/blender/lib/libhiprt64.so*; \
+    rm -f /opt/blender/lib/libOpenImageDenoise_device_hip.so*; \
+    rm -f /opt/blender/lib/libOpenImageDenoise_device_cuda.so*; \
+    rm -rf "/opt/blender/${BLENDER_SERIES}/datafiles/locale"; \
+    rm -rf "/opt/blender/${BLENDER_SERIES}/python/lib/python3.11/test"; \
+    rm -rf "/opt/blender/${BLENDER_SERIES}/python/lib/python3.11/idlelib"; \
+    rm -rf "/opt/blender/${BLENDER_SERIES}/python/lib/python3.11/tkinter"; \
+    rm -rf "/opt/blender/${BLENDER_SERIES}/python/lib/python3.11/lib2to3"; \
+    find /opt/blender -name '__pycache__' -type d -prune -exec rm -rf {} +; \
+    test -f /opt/blender/lib/libcycles_kernel_oneapi_aot.so; \
+    test -d /opt/blender/lib/mesa; \
+    test -x /opt/blender/blender
+
+# Fail the build loudly if any shared library is unresolved, rather than
+# crash-looping on the platform.
+RUN set -eux; \
+    if ldd /opt/blender/blender | grep -i 'not found'; then \
+      echo 'ERROR: Blender has unresolved shared libraries'; \
+      exit 1; \
+    fi; \
+    /opt/blender/blender --version
+
+# Python dependencies for the MCP server and HTTP gateway.
+COPY requirements.txt /tmp/requirements.txt
+RUN set -eux; \
+    python3 -m venv /opt/venv; \
+    /opt/venv/bin/pip install --no-cache-dir --upgrade pip; \
+    /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt
+
+# Install the MCP addon where Blender 4.5 actually looks.
+# addon_utils.paths() uses "addons_core" for the first (bundled) script path and
+# "addons" only for later/user paths, so scripts/addons here is silently ignored.
+# The assertion makes a bad install fail the build instead of shipping broken.
+RUN set -eux; \
+    ADDON_SRC="$(/opt/venv/bin/python -c 'import blender_mcp.addon_manager as m; print(m.get_bundled_addon_path())')"; \
+    mkdir -p "/opt/blender/${BLENDER_SERIES}/scripts/addons_core"; \
+    cp "$ADDON_SRC" "/opt/blender/${BLENDER_SERIES}/scripts/addons_core/addon.py"; \
+    BLENDER_USER_RESOURCES=/tmp/verify /opt/blender/blender -b --factory-startup --python-expr "import addon_utils, bpy; addon_utils.enable('addon', default_set=True); assert hasattr(bpy.types.Scene, 'blendermcp_port'), 'MCP addon did not register'; print('ADDON VERIFY OK')" > /tmp/verify.log 2>&1; \
+    cat /tmp/verify.log; \
+    grep -q 'ADDON VERIFY OK' /tmp/verify.log; \
+    rm -rf /tmp/verify /tmp/verify.log
+
+WORKDIR /app
+COPY app/ /app/app/
+
+RUN mkdir -p /data && chmod 777 /data
+VOLUME ["/data"]
+
+# Defaults tuned for blitz's Small size (512 MB ceiling).
+ENV PORT=8080
+ENV BLENDER_MODE=headless
+ENV BLENDER_HOST=127.0.0.1
+ENV BLENDER_PORT=9876
+ENV BLENDER_BIN=/opt/blender/blender
+ENV BLENDER_SERIES=${BLENDER_SERIES}
+ENV DATA_DIR=/data
+ENV DISPLAY_NUM=99
+ENV SCREEN_GEOMETRY=1024x768x24
+ENV AUTOSAVE_SECONDS=300
+ENV DISABLE_TELEMETRY=1
+ENV BLENDER_MCP_DISABLE_TELEMETRY=1
+ENV LIBGL_ALWAYS_SOFTWARE=1
+ENV GALLIUM_DRIVER=llvmpipe
+ENV LP_NUM_THREADS=1
+ENV OMP_NUM_THREADS=1
+ENV MALLOC_ARENA_MAX=2
+ENV MEMORY_CACHE_MB=128
+ENV UNDO_STEPS=4
+ENV UNDO_MEMORY_MB=64
+ENV GL_TEXTURE_LIMIT=CLAMP_512
+ENV CYCLES_SAMPLES=32
+ENV CYCLES_CPU_THREADS=1
+ENV LOOK_ENGINE=CYCLES
+ENV LOOK_SAMPLES=16
+ENV LOOK_MAX_SIZE=640
+ENV DEFAULT_RES_X=640
+ENV DEFAULT_RES_Y=480
+
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/bin/tini", "--", "python3", "-m", "app.supervisor"]
